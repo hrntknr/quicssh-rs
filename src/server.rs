@@ -1,8 +1,9 @@
 use clap::Parser;
-use quinn::{Endpoint, ServerConfig, VarInt};
+use quinn::{Endpoint, ServerConfig};
 
 use log::{debug, error, info};
 use std::error::Error;
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,10 +17,16 @@ pub struct Opt {
     /// Address of the ssh server
     #[clap(long = "proxy-to", short = 'p', default_value = "127.0.0.1:22")]
     proxy_to: SocketAddr,
+    /// Idle timeout in seconds
+    #[clap(long = "idle", short = 'i', default_value = "60")]
+    idle: u64,
+    // Keep alive interval in seconds
+    #[clap(long = "keep-alive", short = 'k', default_value = "1")]
+    keep_alive: u64,
 }
 
 /// Returns default server configuration along with its certificate.
-fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
+fn configure_server(idle: u64, keep_alive: u64) -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.serialize_der().unwrap();
     let priv_key = cert.serialize_private_key_der();
@@ -29,8 +36,11 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    transport_config.max_idle_timeout(Some(Duration::from_secs(idle).try_into()?));
+    transport_config.max_backoff_exponent(0);
+    if keep_alive > 0 {
+        transport_config.keep_alive_interval(Some(Duration::from_secs(keep_alive)));
+    }
     #[cfg(any(windows, os = "linux"))]
     transport_config.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 
@@ -38,15 +48,20 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
 }
 
 #[allow(unused)]
-pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
-    let (server_config, server_cert) = configure_server()?;
+pub fn make_server_endpoint(
+    bind_addr: SocketAddr,
+    idle: u64,
+    keep_alive: u64,
+) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
+    let (server_config, server_cert) = configure_server(idle, keep_alive)?;
     let endpoint = Endpoint::server(server_config, bind_addr)?;
     Ok((endpoint, server_cert))
 }
 
 #[tokio::main]
 pub async fn run(options: Opt) -> Result<(), Box<dyn Error>> {
-    let (endpoint, _) = make_server_endpoint(options.listen).unwrap();
+    let (endpoint, _) =
+        make_server_endpoint(options.listen, options.idle, options.keep_alive).unwrap();
     // accept a single connection
     loop {
         let incoming_conn = match endpoint.accept().await {
@@ -131,7 +146,7 @@ async fn handle_connection(proxy_for: SocketAddr, connection: quinn::Connection)
                 Ok(Some(n)) => {
                     debug!("[server] recv data from quic stream {} bytes", n);
                     if n == 0 {
-                        continue;
+                        return;
                     }
                     match ssh_write.write_all(&buf[..n]).await {
                         Ok(_) => (),

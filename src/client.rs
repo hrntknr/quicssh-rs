@@ -1,8 +1,13 @@
 // #![cfg(feature = "rustls")]
 
 use clap::Parser;
-use quinn::{ClientConfig, Endpoint, VarInt};
-use std::{error::Error, net::SocketAddr, net::ToSocketAddrs, sync::Arc};
+use quinn::{ClientConfig, Endpoint};
+use std::{
+    error::Error,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(not(windows))]
@@ -22,6 +27,12 @@ pub struct Opt {
     /// Client address
     #[clap(long = "bind", short = 'b')]
     bind_addr: Option<SocketAddr>,
+    /// Idle timeout in seconds
+    #[clap(long = "idle", short = 'i', default_value = "60")]
+    idle: u64,
+    // Keep alive interval in seconds
+    #[clap(long = "keep-alive", short = 'k', default_value = "1")]
+    keep_alive: u64,
 }
 
 /// Enables MTUD if supported by the operating system
@@ -60,7 +71,7 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-fn configure_client() -> Result<ClientConfig, Box<dyn Error>> {
+fn configure_client(idle: u64, keep_alive: u64) -> Result<ClientConfig, Box<dyn Error>> {
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -68,8 +79,11 @@ fn configure_client() -> Result<ClientConfig, Box<dyn Error>> {
 
     let mut client_config = ClientConfig::new(Arc::new(crypto));
     let mut transport_config = enable_mtud_if_supported();
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    transport_config.max_idle_timeout(Some(Duration::from_secs(idle).try_into()?));
+    transport_config.max_backoff_exponent(0);
+    if keep_alive > 0 {
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive)));
+    }
     client_config.transport_config(Arc::new(transport_config));
 
     Ok(client_config)
@@ -81,8 +95,12 @@ fn configure_client() -> Result<ClientConfig, Box<dyn Error>> {
 ///
 /// - server_certs: list of trusted certificates.
 #[allow(unused)]
-pub fn make_client_endpoint(bind_addr: SocketAddr) -> Result<Endpoint, Box<dyn Error>> {
-    let client_cfg = configure_client()?;
+pub fn make_client_endpoint(
+    bind_addr: SocketAddr,
+    idle: u64,
+    keep_alive: u64,
+) -> Result<Endpoint, Box<dyn Error>> {
+    let client_cfg = configure_client(idle, keep_alive)?;
     let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
@@ -102,16 +120,20 @@ pub async fn run(options: Opt) -> Result<(), Box<dyn Error>> {
 
     info!("[client] Connecting to {:?}", remote);
 
-    let endpoint = make_client_endpoint(match options.bind_addr {
-        None => if remote.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        }
-        .parse()
-        .unwrap(),
-        Some(local) => local,
-    })?;
+    let endpoint = make_client_endpoint(
+        match options.bind_addr {
+            None => if remote.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            }
+            .parse()
+            .unwrap(),
+            Some(local) => local,
+        },
+        options.idle,
+        options.keep_alive,
+    )?;
     // connect to server
     let connection = endpoint
         .connect(remote, url.host_str().unwrap_or("localhost"))
@@ -170,7 +192,7 @@ pub async fn run(options: Opt) -> Result<(), Box<dyn Error>> {
                 // closed
                 Ok(n) => {
                     if n == 0 {
-                        continue;
+                        return;
                     }
                     debug!("[client] recv data from stdin {} bytes", n);
                     // Copy the data back to socket
